@@ -47,7 +47,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         intent.getStringExtra("screen")?.let { screenState.value = it }
-        UpdateManager.schedulePeriodic(this)
+        try { UpdateManager.schedulePeriodic(this) } catch (e: Throwable) { CrashLog.save(this, "schedulePeriodic: " + e.stackTraceToString().take(3000)) }
         setContent { App(screenState) }
     }
     override fun onNewIntent(intent: Intent) { super.onNewIntent(intent); intent.getStringExtra("screen")?.let { screenState.value = it } }
@@ -208,6 +208,13 @@ private fun UpdatesScreen(prefs: Prefs, lang: String, t: (String) -> String) {
 private fun DiagScreen(prefs: Prefs, lang: String, t: (String) -> String) {
     Panel {
         Text(t("diag"), fontWeight = FontWeight.Bold)
+        val ctx = LocalContext.current
+        var crash by remember { mutableStateOf(CrashLog.read(ctx)) }
+        if (crash.isNotEmpty()) {
+            Text(if (lang == "ar") "آخر خطأ:" else "Last error:", color = Gold, modifier = Modifier.padding(top = 6.dp))
+            Text(crash, fontSize = 10.sp, color = Color.White)
+            TextButton(onClick = { CrashLog.clear(ctx); crash = "" }) { Text(if (lang == "ar") "مسح" else "Clear") }
+        }
         Text(prefs.lastDiag.ifEmpty { "-" }, fontSize = 12.sp, color = Color.LightGray, modifier = Modifier.padding(top = 6.dp))
     }
 }

@@ -74,6 +74,14 @@ class AssistantService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         prefs = Prefs(this); wm = getSystemService(WINDOW_SERVICE) as WindowManager
         if (intent?.action == ACTION_STOP) { shutdown(); return START_NOT_STICKY }
+        try { return startCapture(intent) } catch (e: Throwable) {
+            CrashLog.save(this, "service start: " + e.stackTraceToString().take(4000))
+            try { shutdown() } catch (_: Throwable) { }
+            return START_NOT_STICKY
+        }
+    }
+
+    private fun startCapture(intent: Intent?): Int {
         startForegroundCompat()
         val code = intent?.getIntExtra("code", Activity.RESULT_CANCELED) ?: Activity.RESULT_CANCELED
         @Suppress("DEPRECATION") val data = intent?.getParcelableExtra<Intent>("data")
