@@ -42,6 +42,9 @@ android {
                 storePassword = ksPass
                 keyAlias = ksAlias
                 keyPassword = keyPass
+                enableV1Signing = true
+                enableV2Signing = true
+                enableV3Signing = true
             }
         }
     }
@@ -49,7 +52,7 @@ android {
     buildTypes {
         release {
             isMinifyEnabled = true
-            isShrinkResources = true
+            isShrinkResources = false
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
             if (signingConfigured) signingConfig = signingConfigs.getByName("release")
         }
