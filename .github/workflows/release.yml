@@ -1,0 +1,158 @@
+name: Release
+# Manual release: builds, signs with the PERMANENT key, verifies, and publishes to the separate LudoAI-Updates repo.
+on:
+  workflow_dispatch:
+    inputs:
+      notes_en: { description: 'Release notes (English)', required: true, default: 'Improvements and fixes.' }
+      notes_ar: { description: 'Release notes (Arabic)', required: false, default: 'تحسينات وإصلاحات.' }
+      publish:  { description: 'Publish to LudoAI-Updates', type: boolean, default: true }
+      mandatory: { description: 'Mark update as mandatory', type: boolean, default: false }
+permissions:
+  contents: read
+env:
+  UPDATES_OWNER: Deeper1deep
+  UPDATES_REPO: LudoAI-Updates
+  APP_ID: com.ludoai.assistant
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: '17' }
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Require signing configuration (never generates a key)
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          missing=""
+          for n in KEYSTORE_BASE64 KEYSTORE_PASSWORD KEY_ALIAS KEY_PASSWORD; do
+            if [ -z "${!n}" ]; then missing="$missing $n"; fi
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::Signing secrets missing:$missing. See docs/SIGNING.md. The release is aborted; no replacement key is generated."
+            exit 1
+          fi
+          printf '%s' "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/ludoai-release.jks"
+          echo "KEYSTORE_PATH=$RUNNER_TEMP/ludoai-release.jks" >> "$GITHUB_ENV"
+
+      - name: Work out the next version (continuity with published releases)
+        run: |
+          python3 - <<'PY'
+          import json, os, urllib.request, urllib.error
+          props = dict(l.strip().split('=',1) for l in open('version.properties') if '=' in l and not l.startswith('#'))
+          url = f"https://raw.githubusercontent.com/{os.environ['UPDATES_OWNER']}/{os.environ['UPDATES_REPO']}/main/latest.json"
+          remote = 0
+          try:
+              remote = json.load(urllib.request.urlopen(url, timeout=20))['versionCode']
+              print('Latest published versionCode:', remote)
+          except urllib.error.HTTPError as e:
+              if e.code != 404: raise
+              print('No published release yet (first release).')
+          code = max(remote + 1, int(props['VERSION_CODE']))
+          name = f"{props['VERSION_MAJOR']}.{props['VERSION_MINOR']}.{code-1}"
+          with open(os.environ['GITHUB_ENV'], 'a') as f:
+              f.write(f"VERSION_CODE={code}\nVERSION_NAME={name}\nREMOTE_CODE={remote}\n")
+          print('Building', name, 'versionCode', code)
+          PY
+
+      - name: Compile checks and tests
+        run: ./gradlew --no-daemon testDebugUnitTest
+
+      - name: Build signed release APK
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: ./gradlew --no-daemon assembleRelease -PversionCode=$VERSION_CODE -PversionName=$VERSION_NAME
+
+      - name: Verify signature, applicationId and update compatibility
+        run: |
+          BT=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -1)
+          APK=$(ls app/build/outputs/apk/release/*.apk | head -1)
+          "$BT/apksigner" verify --verbose --print-certs "$APK" > /tmp/sig.txt
+          grep -q "Verified using v2 scheme.*true\|Verified using v3 scheme.*true" /tmp/sig.txt || { echo "::error::APK is not signed"; exit 1; }
+          CERT=$(grep -i "certificate SHA-256 digest" /tmp/sig.txt | head -1 | awk '{print $NF}' | tr 'A-F' 'a-f')
+          echo "Signing certificate SHA-256: $CERT"
+          PKG=$("$BT/aapt2" dump packagename "$APK")
+          [ "$PKG" = "$APP_ID" ] || { echo "::error::applicationId changed ($PKG != $APP_ID). Aborting."; exit 1; }
+          # the signing identity must equal the one of the previous release
+          python3 - "$CERT" <<'PY'
+          import json, os, sys, urllib.request, urllib.error
+          cert = sys.argv[1]
+          url = f"https://raw.githubusercontent.com/{os.environ['UPDATES_OWNER']}/{os.environ['UPDATES_REPO']}/main/latest.json"
+          try:
+              prev = json.load(urllib.request.urlopen(url, timeout=20))
+          except urllib.error.HTTPError as e:
+              if e.code == 404: print('First release: nothing to compare.'); sys.exit(0)
+              raise
+          if prev.get('certSha256') and prev['certSha256'] != cert:
+              print('::error::Signing key differs from the published release. Updates would fail to install. Aborting.'); sys.exit(1)
+          print('Signing identity matches the published release.')
+          PY
+          echo "CERT_SHA256=$CERT" >> "$GITHUB_ENV"
+          echo "APK_PATH=$APK" >> "$GITHUB_ENV"
+
+      - name: Generate release metadata
+        env:
+          NOTES_EN: ${{ inputs.notes_en }}
+          NOTES_AR: ${{ inputs.notes_ar }}
+          MANDATORY: ${{ inputs.mandatory }}
+        run: |
+          mkdir -p out
+          cp "$APK_PATH" "out/ludoai-v$VERSION_NAME.apk"
+          python3 - <<'PY'
+          import hashlib, json, os, datetime
+          apk = f"out/ludoai-v{os.environ['VERSION_NAME']}.apk"
+          h = hashlib.sha256(open(apk,'rb').read()).hexdigest()
+          tag = f"v{os.environ['VERSION_NAME']}"
+          info = {
+            "applicationId": os.environ['APP_ID'],
+            "versionName": os.environ['VERSION_NAME'],
+            "versionCode": int(os.environ['VERSION_CODE']),
+            "apkUrl": f"https://github.com/{os.environ['UPDATES_OWNER']}/{os.environ['UPDATES_REPO']}/releases/download/{tag}/ludoai-{tag}.apk",
+            "sha256": h, "sizeBytes": os.path.getsize(apk),
+            "certSha256": os.environ['CERT_SHA256'],
+            "minVersionCode": 1,
+            "mandatory": os.environ.get('MANDATORY') == 'true',
+            "publishedAt": datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+            "releaseNotes": {"en": os.environ['NOTES_EN'], "ar": os.environ.get('NOTES_AR','')},
+          }
+          json.dump(info, open('out/latest.json','w'), ensure_ascii=False, indent=2)
+          print('sha256', h)
+          PY
+
+      - name: Publish to LudoAI-Updates
+        if: ${{ inputs.publish }}
+        env:
+          GH_TOKEN: ${{ secrets.UPDATES_REPO_TOKEN }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then echo "::error::UPDATES_REPO_TOKEN secret missing (fine-grained token, Contents read/write on LudoAI-Updates only)."; exit 1; fi
+          TAG="v$VERSION_NAME"
+          gh release create "$TAG" "out/ludoai-$TAG.apk" --repo "$UPDATES_OWNER/$UPDATES_REPO" \
+            --title "Ludo AI Assistant $VERSION_NAME" --notes "${{ inputs.notes_en }}"
+          git clone --depth 1 "https://x-access-token:${GH_TOKEN}@github.com/$UPDATES_OWNER/$UPDATES_REPO.git" upd 2>/dev/null
+          cp out/latest.json upd/latest.json
+          python3 - <<'PY'
+          import json, os
+          p = 'upd/versions.json'
+          hist = json.load(open(p)) if os.path.exists(p) else []
+          new = json.load(open('out/latest.json'))
+          hist = [h for h in hist if h['versionCode'] != new['versionCode']] + [new]
+          json.dump(hist, open(p,'w'), ensure_ascii=False, indent=2)
+          with open('upd/CHANGELOG.md','a') as f:
+              f.write(f"\n## {new['versionName']} (code {new['versionCode']}) - {new['publishedAt']}\n\n{new['releaseNotes']['en']}\n\n{new['releaseNotes']['ar']}\n\nSHA-256: `{new['sha256']}`\n")
+          PY
+          cd upd
+          git config user.name "ludoai-release-bot"; git config user.email "ludoai-release-bot@users.noreply.github.com"
+          git add -A && git commit -q -m "Release $TAG" && git push -q origin HEAD:main
+          echo "Published $TAG"
+
+      - name: Remove keystore from runner
+        if: always()
+        run: rm -f "$RUNNER_TEMP/ludoai-release.jks"
