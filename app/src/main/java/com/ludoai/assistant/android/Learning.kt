@@ -27,6 +27,8 @@ object Learning {
     private fun events(c: Context) = File(dir(c), "events.jsonl")
     private fun frames(c: Context) = dir(c).listFiles { f -> f.name.startsWith("frame_") }?.sortedBy { it.name } ?: emptyList()
 
+    private fun diceFrames(c: Context) = dir(c).listFiles { f -> f.name.startsWith("dice_") }?.sortedBy { it.name } ?: emptyList()
+
     fun sizeBytes(c: Context): Long = dir(c).listFiles()?.sumOf { it.length() } ?: 0L
     fun frameCount(c: Context) = frames(c).size
 
@@ -50,6 +52,7 @@ object Learning {
         if (key) {
             val name = saveFrame(c, frame, a!!, now)
             if (name != null) { ev.put("frame", name); lastFrameAt = now }
+            saveDice(c, frame, a, now)?.let { ev.put("diceFrame", it) }
         }
         lastSig = sig.ifEmpty { lastSig }; if (diceV > 0) lastDice = diceV
         val f = events(c)
@@ -73,9 +76,36 @@ object Learning {
         return name
     }
 
+    /**
+     * Small 2x2 mosaic of the four dice slots that sit just below/above the board (3x3 cells each, scaled to 128 px).
+     * The crops start right of the avatar column, so names and avatars are not included. Skin-specific guess, validated on one skin.
+     */
+    private fun saveDice(c: Context, frame: Frame, a: Analysis, now: Long): String? {
+        val g = a.board!!.geometry
+        val t = 128
+        val out = IntArray(2 * t * 2 * t)
+        val cols = doubleArrayOf(3.2, 8.9); val rows = doubleArrayOf(-4.6, 16.6)
+        var any = false
+        for (ry in 0..1) for (cx in 0..1) {
+            val x0 = g.x(cols[cx]); val y0 = g.y(rows[ry]); val sz = g.cell * 3.0
+            for (j in 0 until t) for (i in 0 until t) {
+                val sx = (x0 + i * sz / t).toInt(); val sy = (y0 + j * sz / t).toInt()
+                if (sx in 0 until frame.w && sy in 0 until frame.h) { out[(ry * t + j) * 2 * t + cx * t + i] = frame.px[sy * frame.w + sx]; any = true }
+                else out[(ry * t + j) * 2 * t + cx * t + i] = 0xFF000000.toInt()
+            }
+        }
+        if (!any) return null
+        val bmp = Bitmap.createBitmap(out, 2 * t, 2 * t, Bitmap.Config.ARGB_8888)
+        val bos = ByteArrayOutputStream(); bmp.compress(Bitmap.CompressFormat.JPEG, 60, bos); bmp.recycle()
+        val name = "dice_$now.jpg"
+        File(dir(c), name).writeBytes(bos.toByteArray())
+        diceFrames(c).dropLast(MAX_FRAMES).forEach { it.delete() }
+        return name
+    }
+
     /** One plain-text file (WhatsApp accepts .txt): header, EVENT lines, FRAME lines (base64 JPEG). */
     fun exportText(c: Context): File? {
-        val ev = events(c); val fr = frames(c)
+        val ev = events(c); val fr = frames(c) + diceFrames(c)
         if (!ev.exists() && fr.isEmpty()) return null
         val outDir = File(c.cacheDir, "learning-export").apply { mkdirs(); listFiles()?.forEach { it.delete() } }
         val out = File(outDir, "ludoai-learning-${System.currentTimeMillis() / 1000}.txt")
