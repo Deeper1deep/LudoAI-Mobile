@@ -241,6 +241,7 @@ class AssistantService : Service() {
             a.board?.let { append("cell=${"%.1f".format(it.geometry.cell)} colours=${it.seatColors}\n") }
             a.counts.forEach { (s, c) -> append("$s yard=${c.yard} board=${c.onBoard} finished?=${c.finishedInferred}\n") }
         }
+        if (prefs.learning) try { Learning.record(this, frame, a, prefs.mode.players, manualDice != null) } catch (e: Throwable) { CrashLog.save(this, "learning: " + e.stackTraceToString().take(2000)) }
         arrow?.target = null; arrow?.invalidate()
         if (a == null || !a.ok) { setResult(S.get("recapture", lang), a?.confidence ?: 0.0, S.get("you", lang) + ": " + yourColor); return }
         val best = a.best
