@@ -150,13 +150,31 @@ private fun SettingsScreen(prefs: Prefs, lang: String, setLang: (String) -> Unit
     var autoU by remember { mutableStateOf(prefs.autoUpdateCheck) }; var six by remember { mutableStateOf(prefs.sixToEnter) }
     var exact by remember { mutableStateOf(prefs.exactFinish) }; var safe by remember { mutableStateOf(prefs.safeSquares) }
     var extra6 by remember { mutableStateOf(prefs.extraTurnOnSix) }
+    var learn by remember { mutableStateOf(prefs.learning) }
     val ctx = LocalContext.current
     Panel { OutlinedButton(onClick = { setLang(if (lang == "ar") "en" else "ar") }) { Text(t("lang")) } }
     Panel {
         SwitchRow(t("auto"), autoR) { autoR = it; prefs.autoRefresh = it }
         Text(t("autoHint"), color = Color.Gray, fontSize = 11.sp)
         SwitchRow(t("arrow"), arrow) { arrow = it; prefs.showArrow = it }
+        SwitchRow(t("learning"), learn) { learn = it; prefs.learning = it }
         SwitchRow(t("autoupd"), autoU) { autoU = it; prefs.autoUpdateCheck = it; UpdateManager.schedulePeriodic(ctx) }
+    }
+    Panel {
+        Text(t("learnnote"), fontSize = 12.sp, color = Color.LightGray)
+        var size by remember { mutableStateOf(Learning.sizeBytes(ctx)) }
+        Text((size / 1024).toString() + " KB / " + Learning.frameCount(ctx) + " snapshots", fontSize = 12.sp, modifier = Modifier.padding(top = 4.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Button(onClick = {
+                val f = Learning.exportText(ctx)
+                if (f != null) {
+                    val uri = androidx.core.content.FileProvider.getUriForFile(ctx, ctx.packageName + ".fileprovider", f)
+                    val send = Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_STREAM, uri).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    ctx.startActivity(Intent.createChooser(send, null).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                }
+            }) { Text(t("share")) }
+            OutlinedButton(onClick = { Learning.clear(ctx); size = 0L }) { Text(t("clearlearn")) }
+        }
     }
     Panel {
         SwitchRow(t("six"), six) { six = it; prefs.sixToEnter = it }

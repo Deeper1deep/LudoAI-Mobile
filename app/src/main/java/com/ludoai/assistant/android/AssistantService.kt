@@ -271,7 +271,10 @@ class AssistantService : Service() {
                 try {
                     val f = grabFrame()
                     main.post { if (!shuttingDown) { root?.visibility = View.VISIBLE; arrow?.visibility = View.VISIBLE } }   // frame is in memory: restore the overlay at once
-                    if (f != null) { dims = f.w to f.h; a = session.process(f, mode, rules, now) }
+                    if (f != null) {
+                        dims = f.w to f.h; a = session.process(f, mode, rules, now)
+                        if (prefs.learning) try { Learning.record(this@AssistantService, f, a, mode.players, a?.manualDiceActive == true) } catch (e: Throwable) { CrashLog.save(this@AssistantService, "learning: " + e.stackTraceToString().take(2000)) }
+                    }
                 } catch (t: Throwable) {
                     main.post { if (!shuttingDown) { root?.visibility = View.VISIBLE; arrow?.visibility = View.VISIBLE } }
                     CrashLog.save(this@AssistantService, "analysis: " + t.stackTraceToString().take(4000))

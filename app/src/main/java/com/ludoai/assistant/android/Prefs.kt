@@ -20,6 +20,7 @@ class Prefs(ctx: Context) {
     var extraTurnOnSix: Boolean get() = p.getBoolean("extra6", true); set(v) = p.edit().putBoolean("extra6", v).apply()
     var overlayX: Int get() = p.getInt("ox", 20); set(v) = p.edit().putInt("ox", v).apply()
     var overlayY: Int get() = p.getInt("oy", 300); set(v) = p.edit().putInt("oy", v).apply()
+    var learning: Boolean get() = p.getBoolean("learn", false); set(v) = p.edit().putBoolean("learn", v).apply()
     var lastDiag: String get() = p.getString("diag", "")!!; set(v) = p.edit().putString("diag", v).apply()
     var lastUpdateJson: String get() = p.getString("updjson", "")!!; set(v) = p.edit().putString("updjson", v).apply()
     val rules get() = RuleSet(sixToEnter, exactFinish, safeSquares, extraTurnOnSix)
