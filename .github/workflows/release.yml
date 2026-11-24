@@ -142,7 +142,7 @@ jobs:
           trap cleanup EXIT
 
           if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then echo "::error::Release $TAG already exists. History is never overwritten."; exit 1; fi
-          cp "out/ludoai-v$VERSION_NAME.apk" "out/$ASSET"
+          [ "out/ludoai-v$VERSION_NAME.apk" = "out/$ASSET" ] || cp "out/ludoai-v$VERSION_NAME.apk" "out/$ASSET"
           gh release create "$TAG" "out/$ASSET" --repo "$REPO" --draft --title "Ludo AI Assistant $VERSION_NAME" --notes-file out/notes.md
           CREATED=1
 
