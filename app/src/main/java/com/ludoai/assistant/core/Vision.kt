@@ -24,13 +24,13 @@ object Colors {
         return hueClass(hue(r, g, b, mx, mn))
     }
 
-    /** Saturated, bright colour only; null for white/grey/dark/pale. */
-    fun saturated(c: Int): LudoColor? {
+    /** Saturated, bright colour only; null for white/grey/dark/pale. [p] relaxes the thresholds on dim screens. */
+    fun saturated(c: Int, p: ColorProfile = ColorProfile.NEUTRAL): LudoColor? {
         val r = (c shr 16) and 255; val g = (c shr 8) and 255; val b = c and 255
         val mx = max(r, max(g, b)); val mn = min(r, min(g, b))
-        if (mx < 110) return null // dark shadows
+        if (mx < p.minV) return null // dark shadows
         val s = (mx - mn) / mx.toFloat()
-        if (s < 0.55f) return null
+        if (s < p.minS) return null
         val h = hue(r, g, b, mx, mn)
         return when {
             h < 16f || h >= 335f -> LudoColor.RED
@@ -65,6 +65,46 @@ object Colors {
     fun luma(c: Int): Int = (((c shr 16) and 255) * 299 + ((c shr 8) and 255) * 587 + (c and 255) * 114) / 1000
     fun dist(a: Int, b: Int): Int =
         abs(((a shr 16) and 255) - ((b shr 16) and 255)) + abs(((a shr 8) and 255) - ((b shr 8) and 255)) + abs((a and 255) - (b and 255))
+}
+
+/**
+ * Brightness/saturation adaptation. Screens with a night filter, battery saver or low brightness make every colour
+ * duller; the thresholds are relaxed in proportion (never tightened). The hue bands are not changed.
+ */
+class ColorProfile(val vScale: Double = 1.0, val sScale: Double = 1.0) {
+    val minV: Int get() = (110 * vScale).toInt()
+    val minS: Float get() = (0.55 * sScale).toFloat()
+
+    companion object {
+        val NEUTRAL = ColorProfile()
+        /** Dimmed variants tried by the board detector when the neutral profile finds no board. */
+        val DIMMED = listOf(ColorProfile(0.8, 0.85), ColorProfile(0.62, 0.7))
+
+        /** Reference yard colours measured on a real Yalla Ludo screenshot. */
+        private val REF = mapOf(
+            LudoColor.YELLOW to intArrayOf(246, 191, 10), LudoColor.BLUE to intArrayOf(24, 138, 250),
+            LudoColor.GREEN to intArrayOf(14, 189, 70), LudoColor.RED to intArrayOf(238, 57, 40),
+        )
+
+        /** Learns the scale from the yard base colours actually seen on this screen. */
+        fun learn(f: Frame, g: BoardGeometry, seatColors: Map<Seat, LudoColor>): ColorProfile {
+            val vs = ArrayList<Double>(); val ss = ArrayList<Double>()
+            for ((seat, color) in seatColors) {
+                val st = PieceDetector.stats(f, g.x(seat.qx + 0.6), g.y(seat.qy + 0.6), 0.22 * g.cell)
+                if (st.n == 0) continue
+                val r = (st.mean shr 16) and 255; val gg = (st.mean shr 8) and 255; val b = st.mean and 255
+                val mx = max(r, max(gg, b)).toDouble(); val mn = min(r, min(gg, b)).toDouble()
+                if (mx <= 0) continue
+                val ref = REF.getValue(color)
+                val rmx = ref.max().toDouble(); val rmn = ref.min().toDouble()
+                vs += mx / rmx; ss += ((mx - mn) / mx) / ((rmx - rmn) / rmx)
+            }
+            if (vs.size < 2) return NEUTRAL
+            val v = vs.sorted()[vs.size / 2].coerceIn(0.5, 1.0)
+            val s = ss.sorted()[ss.size / 2].coerceIn(0.6, 1.0)
+            return if (v >= 0.97 && s >= 0.97) NEUTRAL else ColorProfile(v, s)
+        }
+    }
 }
 
 data class Blob(val minX: Int, val minY: Int, val maxX: Int, val maxY: Int, val area: Int) {
@@ -140,28 +180,35 @@ data class BoardDetection(
     val seatColors: Map<Seat, LudoColor>,
     val confidence: Double,
     val notes: List<String>,
+    val profile: ColorProfile = ColorProfile.NEUTRAL,
 )
 
 object BoardDetector {
     private data class Cand(val color: LudoColor, val blob: Blob) { val cell get() = (blob.w + blob.h) / 12.0 }
 
-    /** Tries several assumed board sizes (erosion radius) and keeps the most consistent result. */
+    /**
+     * Tries several assumed board sizes (erosion radius) and keeps the most consistent result.
+     * When the normal colour thresholds find no board with usable confidence (dim screen), dimmed profiles are tried.
+     */
     fun detect(f: Frame): BoardDetection? {
         var best: BoardDetection? = null
-        for (div in listOf(16, 12, 22, 30)) {
-            val d = detectWith(f, (0.55 * f.w / div).toInt())
-            if (d != null && (best == null || d.confidence > best.confidence)) best = d
-            if (best != null && best.confidence >= 0.95) break
+        for (profile in listOf(ColorProfile.NEUTRAL) + ColorProfile.DIMMED) {
+            for (div in listOf(16, 12, 22, 30)) {
+                val d = detectWith(f, (0.55 * f.w / div).toInt(), profile)
+                if (d != null && (best == null || d.confidence > best.confidence)) best = d
+                if (best != null && best.confidence >= 0.95) break
+            }
+            if (best != null && best.confidence >= 0.6) break
         }
         return best
     }
 
-    private fun detectWith(f: Frame, erode: Int): BoardDetection? {
+    private fun detectWith(f: Frame, erode: Int, profile: ColorProfile): BoardDetection? {
         val st = max(1, min(f.w, f.h) / 240)
         val minSide = min(f.w, f.h) * 0.08
         val cands = ArrayList<Cand>()
         for (color in LudoColor.values()) {
-            val blobs = Blobs.find(f, st, erode) { Colors.saturated(it) == color }
+            val blobs = Blobs.find(f, st, erode) { Colors.saturated(it, profile) == color }
                 .filter { it.w >= minSide && it.h >= minSide && it.w.toDouble() / it.h in 0.75..1.33 && it.fill > 0.2 }
             blobs.maxByOrNull { it.area }?.let { cands.add(Cand(color, it)) }
         }
@@ -214,11 +261,17 @@ object BoardDetector {
         val g = BoardGeometry(ox, oy, cell)
         if (g.x(0.0) < -cell || g.y(0.0) < -cell || g.x(15.0) > f.w + cell || g.y(15.0) > f.h + cell) { conf *= 0.4; notes += "board outside screen" }
         if (cell < 8) { conf *= 0.5; notes += "board too small" }
-        return BoardDetection(g, assign.mapValues { it.value.color }, conf, notes)
+        return BoardDetection(g, assign.mapValues { it.value.color }, conf, notes, profile)
     }
 }
 
-data class DiceReading(val value: Int, val confidence: Double, val x: Double, val y: Double)
+
+data class DiceReading(val value: Int, val confidence: Double, val x: Double, val y: Double, val seat: Seat? = null)
+
+/** Everything die-like in one frame. [unreadable] counts die-shaped objects whose pips form no valid face (rolling, blurred, covered). */
+data class DiceScan(val readings: List<DiceReading>, val unreadable: Int) {
+    val animating get() = readings.isEmpty() && unreadable > 0
+}
 
 object DiceDetector {
     private val corners = setOf(0, 2, 6, 8)
@@ -234,9 +287,27 @@ object DiceDetector {
         else -> false
     }
 
-    fun detect(f: Frame, g: BoardGeometry, userSeat: Seat = Seat.BOTTOM_LEFT): DiceReading? {
+    /**
+     * Which seat's half of the screen a point lies in, or null when it is too close to the middle to say.
+     * Used as turn evidence: the die is expected next to the player who is rolling.
+     * NOT VERIFIED on real Yalla Ludo screens (see docs/REAL_SCREENSHOT_TESTING.md).
+     */
+    fun seatOf(g: BoardGeometry, x: Double, y: Double): Seat? {
+        val gx = (x - g.left) / g.cell; val gy = (y - g.top) / g.cell
+        if (abs(gx - 7.5) < 1.0 || abs(gy - 7.5) < 1.0) return null
+        val left = gx < 7.5; val top = gy < 7.5
+        return when {
+            left && !top -> Seat.BOTTOM_LEFT
+            left && top -> Seat.TOP_LEFT
+            !left && top -> Seat.TOP_RIGHT
+            else -> Seat.BOTTOM_RIGHT
+        }
+    }
+
+    fun scan(f: Frame, g: BoardGeometry): DiceScan {
         val st = max(1, (g.cell / 10).toInt())
         val found = ArrayList<DiceReading>()
+        var unreadable = 0
         val whites = Blobs.find(f, st) { Colors.classify(it) == Cls.WHITE && Colors.luma(it) > 215 }
         for (b in whites) {
             if (b.w < 0.55 * g.cell || b.w > 2.4 * g.cell || b.h < 0.55 * g.cell || b.h > 2.4 * g.cell) continue
@@ -258,9 +329,14 @@ object DiceDetector {
                 gy * 3 + gx
             }.toSet()
             val ok = validLayout(pips.size, cells) && cells.size == pips.size
-            found.add(DiceReading(pips.size, if (ok) 0.95 else 0.3, b.cx, b.cy))
+            if (ok) found.add(DiceReading(pips.size, 0.95, b.cx, b.cy, seatOf(g, b.cx, b.cy))) else unreadable++
         }
-        val good = found.filter { it.confidence > 0.6 }
+        return DiceScan(found, unreadable)
+    }
+
+    /** Single best reading (the one nearest the user's area), as used before turn tracking existed. */
+    fun detect(f: Frame, g: BoardGeometry): DiceReading? {
+        val good = scan(f, g).readings
         if (good.isEmpty()) return null
         val ux = g.x(3.0); val uy = g.y(12.0)
         val nearest = good.minByOrNull { (it.x - ux) * (it.x - ux) + (it.y - uy) * (it.y - uy) }!!
@@ -281,90 +357,6 @@ object DiceDetector {
     }
 }
 
-data class SeatCounts(val yard: Int, val onBoard: Int, val finishedInferred: Int)
-
-data class Analysis(
-    val ok: Boolean,
-    val confidence: Double,
-    val problems: List<String>,
-    val board: BoardDetection?,
-    val userColor: LudoColor?,
-    val dice: DiceReading?,
-    val state: GameState?,
-    val counts: Map<Seat, SeatCounts>,
-    val ranked: List<ScoredMove>,
-) {
-    val best: ScoredMove? get() = ranked.firstOrNull()
-    val needsRecapture get() = !ok
-}
-
-object Analyzer {
-    const val MIN_CONFIDENCE = 0.6
-
-    fun analyze(f: Frame, mode: GameMode, rules: RuleSet = RuleSet(), manualDice: Int? = null): Analysis {
-        val problems = ArrayList<String>()
-        val bd = BoardDetector.detect(f)
-            ?: return Analysis(false, 0.0, listOf("BOARD_NOT_FOUND"), null, null, null, null, emptyMap(), emptyList())
-        problems += bd.notes
-        var conf = bd.confidence
-        val seatColors = bd.seatColors
-        val userColor = seatColors[Seat.BOTTOM_LEFT]
-        val active = GameState.activeSeats(mode)
-        for (s in active) if (!seatColors.containsKey(s)) { problems += "SEAT_COLOR_UNKNOWN_$s"; conf *= 0.5 }
-        val colorToSeat = seatColors.entries.associate { it.value to it.key }
-
-        val pieces = HashMap<Seat, IntArray>()
-        for (s in Seat.values()) pieces[s] = IntArray(Board.PIECES)
-        val boardRels = HashMap<Seat, MutableList<Int>>()
-        val g = bd.geometry
-        var invalid = 0
-        fun note(seat: Seat, rel: Int) { boardRels.getOrPut(seat) { ArrayList() }.add(rel) }
-        for (idx in 0 until Board.TRACK_LEN) {
-            val cell = Board.track[idx]
-            val startOwner = Seat.values().firstOrNull { it.startIdx == idx }
-            val color = PieceDetector.pieceAt(f, g, cell.col, cell.row, startOwner?.let { seatColors[it] }, startOwner != null) ?: continue
-            val seat = colorToSeat[color] ?: continue
-            val rel = Board.relOnTrack(seat, idx)
-            if (rel == null) { invalid++; continue }
-            note(seat, rel)
-        }
-        for (seat in Seat.values()) {
-            val stds = (Board.FIRST_HOME_REL..56).map { rel -> Board.cellOf(seat, rel)!!.let { PieceDetector.stats(f, g.x(it.col + 0.5), g.y(it.row + 0.5), 0.26 * g.cell).std } }.sorted()
-            val baseline = stds[2]
-            if (baseline > 15.0) { if ("BOARD_OVERLAY" !in problems) problems += "BOARD_OVERLAY"; conf *= 0.85 }
-            for (rel in Board.FIRST_HOME_REL..56) {
-            val cell = Board.cellOf(seat, rel)!!
-            val color = PieceDetector.pieceAt(f, g, cell.col, cell.row, seatColors[seat], false, baseline) ?: continue
-            if (seatColors[seat] == color) note(seat, rel) else invalid++
-            }
-        }
-        if (invalid > 0) { problems += "INCONSISTENT_PIECES"; conf *= 0.6 }
-
-        val counts = HashMap<Seat, SeatCounts>()
-        for ((seat, color) in seatColors) {
-            val onBoard = boardRels[seat].orEmpty().sorted()
-            if (onBoard.size > Board.PIECES) { problems += "TOO_MANY_PIECES_$seat"; conf *= 0.4 }
-            val yard = PieceDetector.yardOccupied(f, g, seat, color)
-            val fin = (Board.PIECES - min(Board.PIECES, onBoard.size) - yard).coerceAtLeast(0)
-            counts[seat] = SeatCounts(yard, onBoard.size, fin)
-            if (onBoard.size + yard > Board.PIECES) { problems += "COUNT_MISMATCH_$seat"; conf *= 0.6 }
-            val arr = pieces.getValue(seat)
-            onBoard.take(Board.PIECES).forEachIndexed { i, r -> arr[i] = r }
-            // pieces beyond onBoard stay at 0 (yard) up to yard count, rest are finished
-            var i = onBoard.size
-            repeat(fin) { if (i < Board.PIECES) arr[i++] = Board.FINISH }
-        }
-        val state = GameState(mode, active, active.associateWith { pieces.getValue(it) })
-
-        val diceR = if (manualDice != null) DiceReading(manualDice, 1.0, 0.0, 0.0) else DiceDetector.detect(f, g)
-        if (diceR == null) { problems += "DICE_NOT_FOUND"; conf *= 0.0 } else conf *= diceR.confidence
-        val ok = conf >= MIN_CONFIDENCE && diceR != null && userColor != null
-        val ranked = if (ok) Strategy.rank(state, Seat.BOTTOM_LEFT, diceR!!.value, rules) else emptyList()
-        if (ok && ranked.isEmpty()) problems += "NO_LEGAL_MOVE"
-        return Analysis(ok, conf, problems, bd, userColor, diceR, state, counts, ranked)
-    }
-}
-
 /** Reference look of the (empty) start-cell icon for each colour, measured from real Yalla Ludo screenshots. */
 object StartTemplates {
     val mean = mapOf(
@@ -375,10 +367,12 @@ object StartTemplates {
     )
 }
 
+class PieceHit(val color: LudoColor, val confidence: Double)
+
 object PieceDetector {
     class Stats(val n: Int, val sat: Map<LudoColor, Int>, val mean: Int, val std: Double)
 
-    fun stats(f: Frame, cx: Double, cy: Double, r: Double): Stats {
+    fun stats(f: Frame, cx: Double, cy: Double, r: Double, profile: ColorProfile = ColorProfile.NEUTRAL): Stats {
         val step = max(1.0, r / 6.0)
         var n = 0; var sr = 0L; var sg = 0L; var sb = 0L; var sl = 0L; var sl2 = 0L
         val sat = HashMap<LudoColor, Int>()
@@ -390,7 +384,7 @@ object PieceDetector {
                     val c = f.at((cx + x).toInt(), (cy + y).toInt())
                     n++; sr += (c shr 16) and 255; sg += (c shr 8) and 255; sb += c and 255
                     val l = Colors.luma(c); sl += l; sl2 += l * l
-                    Colors.saturated(c)?.let { sat.merge(it, 1, Int::plus) }
+                    Colors.saturated(c, profile)?.let { sat.merge(it, 1, Int::plus) }
                 }
                 x += step
             }
@@ -403,51 +397,120 @@ object PieceDetector {
         return Stats(n, sat, mean, std)
     }
 
-    private fun ringMean(f: Frame, g: BoardGeometry, gx: Double, gy: Double, off: Double, rad: Double): Int {
-        var sr = 0; var sg = 0; var sb = 0
-        for ((dx, dy) in listOf(-1 to -1, 1 to -1, -1 to 1, 1 to 1)) {
-            val m = stats(f, g.x(gx + dx * off), g.y(gy + dy * off), rad * g.cell).mean
-            sr += (m shr 16) and 255; sg += (m shr 8) and 255; sb += m and 255
-        }
-        return (0xFF shl 24) or ((sr / 4) shl 16) or ((sg / 4) shl 8) or (sb / 4)
-    }
+    /** 0..1 position of [v] between [lo] (threshold, score 0) and [hi] (score 1). */
+    private fun ramp(v: Double, lo: Double, hi: Double) = ((v - lo) / (hi - lo)).coerceIn(0.0, 1.0)
+
+    /** Maps the weakest of the evidence scores to a confidence in 0.55..1.0 (a detection at threshold is 0.55). */
+    private fun conf(vararg scores: Double) = 0.55 + 0.45 * (scores.minOrNull() ?: 0.0)
 
     /**
-     * Colour of a piece standing on the board cell at grid (col,row), or null.
+     * Colour of a piece standing on the board cell at grid (col,row), with a confidence, or null.
      * [cellColor] is the flat colour of that cell (home lane / start cell) or null for white cells.
      */
-    fun pieceAt(f: Frame, g: BoardGeometry, col: Int, row: Int, cellColor: LudoColor?, isStart: Boolean, laneStdBaseline: Double = 0.0): LudoColor? {
-        val st = stats(f, g.x(col + 0.5), g.y(row + 0.5), 0.26 * g.cell)
+    fun pieceAt(
+        f: Frame, g: BoardGeometry, col: Int, row: Int, cellColor: LudoColor?, isStart: Boolean,
+        laneStdBaseline: Double = 0.0, profile: ColorProfile = ColorProfile.NEUTRAL,
+    ): PieceHit? {
+        val st = stats(f, g.x(col + 0.5), g.y(row + 0.5), 0.26 * g.cell, profile)
         if (st.n == 0) return null
         val top = st.sat.maxByOrNull { it.value } ?: return null
         if (top.value < 0.35 * st.n) return null
         val x = top.key
+        val satScore = ramp(top.value.toDouble() / st.n, 0.35, 0.65)
         return when {
-            cellColor == null -> if (st.std > 18.0) x else null
-            x != cellColor -> if (st.std > 12.0) x else null
+            cellColor == null -> if (st.std > 18.0) PieceHit(x, conf(satScore, ramp(st.std, 18.0, 40.0))) else null
+            x != cellColor -> if (st.std > 12.0) PieceHit(x, conf(satScore, ramp(st.std, 12.0, 32.0))) else null
             isStart -> {
                 val ref = StartTemplates.mean.getValue(x)
-                if (Colors.dist(st.mean, ref) > 45) x else null
+                val d = Colors.dist(st.mean, ref)
+                if (d > 45) PieceHit(x, conf(satScore, ramp(d.toDouble(), 45.0, 110.0))) else null
             }
             else -> {
                 // A lane is flat; a token adds texture. A translucent toast textures every lane cell alike, so
                 // compare with the median of the same lane instead of an absolute value.
-                if (st.std > 22.0 && st.std - laneStdBaseline > 15.0) x else null
+                if (st.std > 22.0 && st.std - laneStdBaseline > 15.0)
+                    PieceHit(x, conf(satScore, ramp(st.std, 22.0, 44.0), ramp(st.std - laneStdBaseline, 15.0, 35.0))) else null
             }
         }
     }
 
-    /** Number of occupied yard circles: a token has texture, the empty circle behind it is flat. */
-    fun yardOccupied(f: Frame, g: BoardGeometry, seat: Seat, color: LudoColor): Int {
-        var count = 0
-        for ((sx, sy) in Board.yardSlots(seat)) {
-            var hit = false
+    /** Occupied yard circles with a confidence each: a token has texture, the empty circle behind it is flat. */
+    fun yardSlots(f: Frame, g: BoardGeometry, seat: Seat, color: LudoColor, profile: ColorProfile = ColorProfile.NEUTRAL): List<YardSlotHit> {
+        val out = ArrayList<YardSlotHit>()
+        Board.yardSlots(seat).forEachIndexed { slot, (sx, sy) ->
+            var best = 0.0
             for ((dx, dy) in listOf(0.0 to 0.0, 0.2 to 0.0, -0.2 to 0.0, 0.0 to 0.2, 0.0 to -0.2)) {
-                val st = stats(f, g.x(sx + dx), g.y(sy + dy), 0.3 * g.cell)
-                if (st.n > 0 && (st.sat[color] ?: 0) >= 0.3 * st.n && st.std > 12.0) { hit = true; break }
+                val st = stats(f, g.x(sx + dx), g.y(sy + dy), 0.3 * g.cell, profile)
+                if (st.n > 0 && (st.sat[color] ?: 0) >= 0.3 * st.n && st.std > 12.0) {
+                    val c = conf(ramp((st.sat[color] ?: 0).toDouble() / st.n, 0.3, 0.6), ramp(st.std, 12.0, 30.0))
+                    if (c > best) best = c
+                }
             }
-            if (hit) count++
+            if (best > 0.0) out += YardSlotHit(slot, best)
         }
-        return count
+        return out
+    }
+}
+
+/** Everything one frame shows, before any memory of earlier frames is applied. */
+data class FrameObservation(
+    val board: BoardDetection?,
+    val seatColors: Map<Seat, LudoColor>,
+    val seats: Map<Seat, SeatObservation>,
+    val dice: DiceScan?,
+    val problems: List<String>,
+    /** Board/piece recognition confidence (dice and turn are judged separately). */
+    val confidence: Double,
+)
+
+object Observer {
+    fun observe(f: Frame, mode: GameMode): FrameObservation {
+        val bd = BoardDetector.detect(f) ?: return FrameObservation(null, emptyMap(), emptyMap(), null, listOf("BOARD_NOT_FOUND"), 0.0)
+        val problems = ArrayList<String>(); problems += bd.notes
+        var conf = bd.confidence
+        val seatColors = bd.seatColors
+        val active = GameState.activeSeats(mode)
+        // two opposite corners fully determine the geometry; only the two playing seats are expected in quick mode
+        if (mode == GameMode.QUICK_2P && active.all { seatColors.containsKey(it) } && conf < 0.9) conf = 0.9
+        for (s in active) if (!seatColors.containsKey(s)) { problems += "SEAT_COLOR_UNKNOWN_$s"; conf *= 0.5 }
+        if (seatColors.values.toSet().size != seatColors.size) { problems += "DUPLICATE_SEAT_COLORS"; conf *= 0.2 }
+        val colorToSeat = seatColors.entries.associate { it.value to it.key }
+        val g = bd.geometry
+        val learned = ColorProfile.learn(f, g, seatColors)
+        val profile = if (learned === ColorProfile.NEUTRAL) bd.profile else learned
+
+        val boardHits = HashMap<Seat, MutableList<BoardHit>>()
+        var invalid = 0
+        for (idx in 0 until Board.TRACK_LEN) {
+            val cell = Board.track[idx]
+            val startOwner = Seat.values().firstOrNull { it.startIdx == idx }
+            val hit = PieceDetector.pieceAt(f, g, cell.col, cell.row, startOwner?.let { seatColors[it] }, startOwner != null, 0.0, profile) ?: continue
+            val seat = colorToSeat[hit.color] ?: continue
+            val rel = Board.relOnTrack(seat, idx)
+            if (rel == null) { invalid++; continue }
+            boardHits.getOrPut(seat) { ArrayList() }.add(BoardHit(rel, hit.confidence))
+        }
+        val trusted = HashMap<Seat, Boolean>()
+        for (seat in Seat.values()) {
+            val stds = (Board.FIRST_HOME_REL..56).map { rel -> Board.cellOf(seat, rel)!!.let { PieceDetector.stats(f, g.x(it.col + 0.5), g.y(it.row + 0.5), 0.26 * g.cell, profile).std } }.sorted()
+            val baseline = stds[2]
+            val overlay = baseline > 15.0
+            if (overlay) { if ("BOARD_OVERLAY" !in problems) problems += "BOARD_OVERLAY"; conf *= 0.85 }
+            trusted[seat] = !overlay
+            for (rel in Board.FIRST_HOME_REL..56) {
+                val cell = Board.cellOf(seat, rel)!!
+                val hit = PieceDetector.pieceAt(f, g, cell.col, cell.row, seatColors[seat], false, baseline, profile) ?: continue
+                if (seatColors[seat] == hit.color) boardHits.getOrPut(seat) { ArrayList() }.add(BoardHit(rel, hit.confidence)) else invalid++
+            }
+        }
+        if (invalid > 0) { problems += "INCONSISTENT_PIECES"; conf *= 0.6 }
+
+        val seats = HashMap<Seat, SeatObservation>()
+        for ((seat, color) in seatColors) {
+            val hits = boardHits[seat].orEmpty()
+            val yard = PieceDetector.yardSlots(f, g, seat, color, profile)
+            seats[seat] = SeatObservation(seat, hits, yard, trusted[seat] ?: true)
+        }
+        return FrameObservation(bd, seatColors, seats, DiceDetector.scan(f, g), problems, conf)
     }
 }

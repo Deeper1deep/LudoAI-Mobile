@@ -1,5 +1,7 @@
 name: Release
 # Manual release: builds, signs with the PERMANENT key, verifies, and publishes to the separate LudoAI-Updates repo.
+# Nothing becomes visible to installed apps until every check passed: the release is created as a DRAFT, its asset is
+# downloaded back and compared, it is then published, checked anonymously, and only THEN is latest.json updated (last step).
 on:
   workflow_dispatch:
     inputs:
@@ -7,8 +9,12 @@ on:
       notes_ar: { description: 'Release notes (Arabic)', required: false, default: 'تحسينات وإصلاحات.' }
       publish:  { description: 'Publish to LudoAI-Updates', type: boolean, default: true }
       mandatory: { description: 'Mark update as mandatory', type: boolean, default: false }
+      min_version_code: { description: 'Oldest versionCode still allowed to run (older ones are forced to update)', required: false, default: '1' }
 permissions:
   contents: read
+concurrency:
+  group: ludoai-release
+  cancel-in-progress: false
 env:
   UPDATES_OWNER: Deeper1deep
   UPDATES_REPO: LudoAI-Updates
@@ -16,12 +22,20 @@ env:
 jobs:
   release:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
         with: { distribution: temurin, java-version: '17' }
       - uses: gradle/actions/setup-gradle@v4
+
+      - name: Validate inputs
+        env:
+          MIN_VERSION_CODE_IN: ${{ inputs.min_version_code }}
+        run: |
+          case "${MIN_VERSION_CODE_IN:-1}" in ''|*[!0-9]*) echo "::error::min_version_code must be a positive integer"; exit 1;; esac
+          echo "MIN_VERSION_CODE=${MIN_VERSION_CODE_IN:-1}" >> "$GITHUB_ENV"
+          python3 .github/scripts/test_release_lib.py
 
       - name: Require signing configuration (never generates a key)
         env:
@@ -41,25 +55,28 @@ jobs:
           printf '%s' "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/ludoai-release.jks"
           echo "KEYSTORE_PATH=$RUNNER_TEMP/ludoai-release.jks" >> "$GITHUB_ENV"
 
-      - name: Work out the next version (continuity with published releases)
+      - name: Work out the next version (monotonic across latest.json, versions.json and tags)
+        env:
+          GH_TOKEN: ${{ secrets.UPDATES_REPO_TOKEN }}
         run: |
-          python3 - <<'PY'
-          import json, os, urllib.request, urllib.error
-          props = dict(l.strip().split('=',1) for l in open('version.properties') if '=' in l and not l.startswith('#'))
-          url = f"https://raw.githubusercontent.com/{os.environ['UPDATES_OWNER']}/{os.environ['UPDATES_REPO']}/main/latest.json"
-          remote = 0
-          try:
-              remote = json.load(urllib.request.urlopen(url, timeout=20))['versionCode']
-              print('Latest published versionCode:', remote)
-          except urllib.error.HTTPError as e:
-              if e.code != 404: raise
-              print('No published release yet (first release).')
-          code = max(remote + 1, int(props['VERSION_CODE']))
-          name = f"{props['VERSION_MAJOR']}.{props['VERSION_MINOR']}.{code-1}"
-          with open(os.environ['GITHUB_ENV'], 'a') as f:
-              f.write(f"VERSION_CODE={code}\nVERSION_NAME={name}\nREMOTE_CODE={remote}\n")
-          print('Building', name, 'versionCode', code)
-          PY
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/remote"
+          base="https://raw.githubusercontent.com/$UPDATES_OWNER/$UPDATES_REPO/main"
+          for f in latest.json versions.json; do
+            code=$(curl -sS -o "$RUNNER_TEMP/remote/$f" -w '%{http_code}' --retry 3 "$base/$f")
+            case "$code" in
+              200) ;;
+              404) rm -f "$RUNNER_TEMP/remote/$f"; echo "No published $f yet." ;;
+              *) echo "::error::Could not read $f from the updates repo (HTTP $code). Refusing to guess the next versionCode."; exit 1 ;;
+            esac
+          done
+          # tags only raise the floor; an empty or failed lookup never lowers it
+          curl -sS --retry 3 -H "Accept: application/vnd.github+json" ${GH_TOKEN:+-H "Authorization: Bearer $GH_TOKEN"} \
+            "https://api.github.com/repos/$UPDATES_OWNER/$UPDATES_REPO/tags?per_page=100" \
+            | python3 -c 'import json,sys; d=json.load(sys.stdin); print("\n".join(t["name"] for t in d) if isinstance(d,list) else "")' > "$RUNNER_TEMP/remote/tags.txt" || : > "$RUNNER_TEMP/remote/tags.txt"
+          LATEST_JSON="$RUNNER_TEMP/remote/latest.json" VERSIONS_JSON="$RUNNER_TEMP/remote/versions.json" TAGS_FILE="$RUNNER_TEMP/remote/tags.txt" \
+            python3 .github/scripts/release_lib.py next-version | tee -a "$GITHUB_ENV"
+          [ "$MIN_VERSION_CODE" -le "$(grep '^VERSION_CODE=' "$GITHUB_ENV" | tail -1 | cut -d= -f2)" ] || { echo "::error::min_version_code is above the new versionCode"; exit 1; }
 
       - name: Compile checks and tests
         run: ./gradlew --no-daemon testDebugUnitTest
@@ -71,86 +88,93 @@ jobs:
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: ./gradlew --no-daemon assembleRelease -PversionCode=$VERSION_CODE -PversionName=$VERSION_NAME
 
-      - name: Verify signature, applicationId and update compatibility
+      - name: Verify the signed APK (signature, certificate, applicationId, versionCode, not debuggable)
         run: |
+          set -euo pipefail
           BT=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -1)
           APK=$(ls app/build/outputs/apk/release/*.apk | head -1)
-          "$BT/apksigner" verify --verbose --print-certs "$APK" > /tmp/sig.txt
-          grep -q "Verified using v2 scheme.*true\|Verified using v3 scheme.*true" /tmp/sig.txt || { echo "::error::APK is not signed"; exit 1; }
-          CERT=$(grep -i "certificate SHA-256 digest" /tmp/sig.txt | head -1 | awk '{print $NF}' | tr 'A-F' 'a-f')
+          "$BT/apksigner" verify --verbose --print-certs "$APK" | tee "$RUNNER_TEMP/sig.txt"
+          grep -q "Verified using v2 scheme.*true\|Verified using v3 scheme.*true" "$RUNNER_TEMP/sig.txt" || { echo "::error::APK is not signed"; exit 1; }
+          [ "$(grep -ci 'certificate SHA-256 digest' "$RUNNER_TEMP/sig.txt")" = "1" ] || { echo "::error::Expected exactly one signer"; exit 1; }
+          CERT=$(grep -i "certificate SHA-256 digest" "$RUNNER_TEMP/sig.txt" | head -1 | awk '{print $NF}' | tr 'A-F' 'a-f')
           echo "Signing certificate SHA-256: $CERT"
-          PKG=$("$BT/aapt2" dump packagename "$APK")
-          [ "$PKG" = "$APP_ID" ] || { echo "::error::applicationId changed ($PKG != $APP_ID). Aborting."; exit 1; }
-          # the signing identity must equal the one of the previous release
-          python3 - "$CERT" <<'PY'
-          import json, os, sys, urllib.request, urllib.error
-          cert = sys.argv[1]
-          url = f"https://raw.githubusercontent.com/{os.environ['UPDATES_OWNER']}/{os.environ['UPDATES_REPO']}/main/latest.json"
-          try:
-              prev = json.load(urllib.request.urlopen(url, timeout=20))
-          except urllib.error.HTTPError as e:
-              if e.code == 404: print('First release: nothing to compare.'); sys.exit(0)
-              raise
-          if prev.get('certSha256') and prev['certSha256'] != cert:
-              print('::error::Signing key differs from the published release. Updates would fail to install. Aborting.'); sys.exit(1)
-          print('Signing identity matches the published release.')
-          PY
+          PINNED=$(tr -d ' \n\r' < release/EXPECTED_CERT_SHA256)
+          [ "$CERT" = "$PINNED" ] || { echo "::error::Signing certificate ($CERT) differs from the pinned production certificate ($PINNED). Existing installs could not be updated. Aborting."; exit 1; }
+          if [ -f "$RUNNER_TEMP/remote/latest.json" ]; then
+            PREV=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("certSha256",""))' "$RUNNER_TEMP/remote/latest.json")
+            [ -z "$PREV" ] || [ "$PREV" = "$CERT" ] || { echo "::error::Certificate differs from the published release. Aborting."; exit 1; }
+          fi
+          "$BT/aapt2" dump badging "$APK" | python3 .github/scripts/release_lib.py badging
+          "$BT/zipalign" -c 4 "$APK" || { echo "::error::APK is not zip-aligned"; exit 1; }
           echo "CERT_SHA256=$CERT" >> "$GITHUB_ENV"
           echo "APK_PATH=$APK" >> "$GITHUB_ENV"
 
-      - name: Generate release metadata
+      - name: Generate release metadata from the verified APK
         env:
           NOTES_EN: ${{ inputs.notes_en }}
           NOTES_AR: ${{ inputs.notes_ar }}
           MANDATORY: ${{ inputs.mandatory }}
         run: |
+          set -euo pipefail
           mkdir -p out
           cp "$APK_PATH" "out/ludoai-v$VERSION_NAME.apk"
-          python3 - <<'PY'
-          import hashlib, json, os, datetime
-          apk = f"out/ludoai-v{os.environ['VERSION_NAME']}.apk"
-          h = hashlib.sha256(open(apk,'rb').read()).hexdigest()
-          tag = f"v{os.environ['VERSION_NAME']}"
-          info = {
-            "applicationId": os.environ['APP_ID'],
-            "versionName": os.environ['VERSION_NAME'],
-            "versionCode": int(os.environ['VERSION_CODE']),
-            "apkUrl": f"https://github.com/{os.environ['UPDATES_OWNER']}/{os.environ['UPDATES_REPO']}/releases/download/{tag}/ludoai-{tag}.apk",
-            "sha256": h, "sizeBytes": os.path.getsize(apk),
-            "certSha256": os.environ['CERT_SHA256'],
-            "minVersionCode": 1,
-            "mandatory": os.environ.get('MANDATORY') == 'true',
-            "publishedAt": datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
-            "releaseNotes": {"en": os.environ['NOTES_EN'], "ar": os.environ.get('NOTES_AR','')},
-          }
-          json.dump(info, open('out/latest.json','w'), ensure_ascii=False, indent=2)
-          print('sha256', h)
-          PY
+          APK_PATH="out/ludoai-v$VERSION_NAME.apk" python3 .github/scripts/release_lib.py metadata
+          APK_PATH="out/ludoai-v$VERSION_NAME.apk" python3 .github/scripts/release_lib.py check
+          echo "APK_PATH=out/ludoai-v$VERSION_NAME.apk" >> "$GITHUB_ENV"
 
-      - name: Publish to LudoAI-Updates
+      - name: Publish to LudoAI-Updates (draft, verify, publish, verify, metadata last)
         if: ${{ inputs.publish }}
         env:
           GH_TOKEN: ${{ secrets.UPDATES_REPO_TOKEN }}
         run: |
+          set -euo pipefail
           if [ -z "$GH_TOKEN" ]; then echo "::error::UPDATES_REPO_TOKEN secret missing (fine-grained token, Contents read/write on LudoAI-Updates only)."; exit 1; fi
-          TAG="v$VERSION_NAME"
-          gh release create "$TAG" "out/ludoai-$TAG.apk" --repo "$UPDATES_OWNER/$UPDATES_REPO" \
-            --title "Ludo AI Assistant $VERSION_NAME" --notes "${{ inputs.notes_en }}"
-          git clone --depth 1 "https://x-access-token:${GH_TOKEN}@github.com/$UPDATES_OWNER/$UPDATES_REPO.git" upd 2>/dev/null
-          cp out/latest.json upd/latest.json
-          python3 - <<'PY'
-          import json, os
-          p = 'upd/versions.json'
-          hist = json.load(open(p)) if os.path.exists(p) else []
-          new = json.load(open('out/latest.json'))
-          hist = [h for h in hist if h['versionCode'] != new['versionCode']] + [new]
-          json.dump(hist, open(p,'w'), ensure_ascii=False, indent=2)
-          with open('upd/CHANGELOG.md','a') as f:
-              f.write(f"\n## {new['versionName']} (code {new['versionCode']}) - {new['publishedAt']}\n\n{new['releaseNotes']['en']}\n\n{new['releaseNotes']['ar']}\n\nSHA-256: `{new['sha256']}`\n")
-          PY
+          TAG="v$VERSION_NAME"; REPO="$UPDATES_OWNER/$UPDATES_REPO"; ASSET="ludoai-$TAG.apk"
+          WANT=$(python3 -c 'import json; print(json.load(open("out/latest.json"))["sha256"])')
+          METADATA_PUSHED=0; CREATED=0
+          cleanup() {
+            code=$?
+            if [ "$code" != "0" ] && [ "$CREATED" = "1" ] && [ "$METADATA_PUSHED" = "0" ]; then
+              echo "::warning::Publishing failed; removing the unreferenced release $TAG so nothing half-finished stays visible."
+              gh release delete "$TAG" --repo "$REPO" --cleanup-tag --yes || true
+            fi
+          }
+          trap cleanup EXIT
+
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then echo "::error::Release $TAG already exists. History is never overwritten."; exit 1; fi
+          cp "out/ludoai-v$VERSION_NAME.apk" "out/$ASSET"
+          gh release create "$TAG" "out/$ASSET" --repo "$REPO" --draft --title "Ludo AI Assistant $VERSION_NAME" --notes-file out/notes.md
+          CREATED=1
+
+          # the uploaded asset must be byte-identical to the verified APK
+          mkdir -p dl && gh release download "$TAG" --repo "$REPO" --pattern "$ASSET" --dir dl
+          GOT=$(sha256sum "dl/$ASSET" | awk '{print $1}')
+          [ "$GOT" = "$WANT" ] || { echo "::error::Uploaded asset differs from the verified APK ($GOT != $WANT)"; exit 1; }
+
+          gh release edit "$TAG" --repo "$REPO" --draft=false --latest
+
+          # anonymous download, exactly as an installed app would do it
+          URL=$(python3 -c 'import json; print(json.load(open("out/latest.json"))["apkUrl"])')
+          ok=0
+          for i in 1 2 3 4 5 6; do
+            if curl -fsSL --retry 2 -o anon.apk "$URL" && [ "$(sha256sum anon.apk | awk '{print $1}')" = "$WANT" ]; then ok=1; break; fi
+            sleep 10
+          done
+          [ "$ok" = "1" ] || { echo "::error::Public download of $URL does not match the verified APK"; exit 1; }
+
+          # metadata LAST: only now do installed apps learn about the release
+          git clone --depth 1 "https://x-access-token:${GH_TOKEN}@github.com/$REPO.git" upd 2>/dev/null
+          python3 .github/scripts/release_lib.py history upd
           cd upd
           git config user.name "ludoai-release-bot"; git config user.email "ludoai-release-bot@users.noreply.github.com"
-          git add -A && git commit -q -m "Release $TAG" && git push -q origin HEAD:main
+          git add -A && git commit -q -m "Release $TAG"
+          pushed=0
+          for i in 1 2 3; do
+            if git push -q origin HEAD:main; then pushed=1; break; fi
+            git pull -q --rebase origin main || break
+          done
+          [ "$pushed" = "1" ] || { echo "::error::Could not push latest.json"; exit 1; }
+          METADATA_PUSHED=1
           echo "Published $TAG"
 
       - name: Remove keystore from runner

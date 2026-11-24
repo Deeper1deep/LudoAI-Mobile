@@ -14,7 +14,9 @@ jobs:
       - uses: actions/setup-java@v4
         with: { distribution: temurin, java-version: '17' }
       - uses: gradle/actions/setup-gradle@v4
-      - name: Unit tests (board, strategy, vision, update logic)
+      - name: Release script tests (versioning, metadata, history)
+        run: python3 .github/scripts/test_release_lib.py
+      - name: Unit tests (board, strategy, vision, session, gate, update logic)
         run: ./gradlew --no-daemon testDebugUnitTest
       - name: Compile debug APK
         run: ./gradlew --no-daemon assembleDebug

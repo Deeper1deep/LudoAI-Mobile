@@ -10,10 +10,14 @@ import android.app.job.JobService
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ApplicationInfo
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.provider.Settings
 import androidx.core.app.NotificationCompat
+import android.os.Build
 import androidx.core.content.FileProvider
+import java.security.MessageDigest
 import com.ludoai.assistant.BuildConfig
 import com.ludoai.assistant.core.UpdateInfo
 import com.ludoai.assistant.core.UpdateLogic
@@ -26,7 +30,7 @@ object UpdateManager {
     const val CHANNEL = "updates"
 
     sealed class Result {
-        data class Available(val info: UpdateInfo) : Result()
+        data class Available(val info: UpdateInfo, val required: Boolean = false) : Result()
         object UpToDate : Result()
         data class Error(val message: String) : Result()
     }
@@ -38,15 +42,60 @@ object UpdateManager {
         return c
     }
 
-    /** Blocking. Call off the main thread. */
+    private fun expectedApplicationId(ctx: Context) = ctx.packageName.removeSuffix(".debug")
+
+    /** Reason (problem codes) of the last failed download/verification, for the UI. */
+    @Volatile var lastFailure: String = ""
+
+    /** Blocking. Call off the main thread. Metadata is validated fail-closed before anything is offered. */
     fun check(ctx: Context): Result = try {
         val url = UpdateLogic.metadataUrl(BuildConfig.UPDATES_OWNER, BuildConfig.UPDATES_REPO)
         val text = open(url).inputStream.bufferedReader().use { it.readText() }
         val info = UpdateLogic.parse(text)
-        if (info.applicationId.isNotEmpty() && info.applicationId != ctx.packageName.removeSuffix(".debug")) Result.Error("applicationId mismatch")
-        else if (UpdateLogic.isNewer(BuildConfig.VERSION_CODE, info)) { Prefs(ctx).lastUpdateJson = text; Result.Available(info) }
-        else Result.UpToDate
+        val problems = UpdateLogic.validate(info, expectedApplicationId(ctx), BuildConfig.UPDATES_OWNER, BuildConfig.UPDATES_REPO)
+        if (problems.isNotEmpty()) Result.Error(problems.joinToString(","))
+        else if (UpdateLogic.isNewer(BuildConfig.VERSION_CODE, info)) {
+            Prefs(ctx).lastUpdateJson = text
+            Result.Available(info, UpdateLogic.isRequired(BuildConfig.VERSION_CODE, info))
+        } else Result.UpToDate
     } catch (e: Exception) { Result.Error(e.message ?: e.javaClass.simpleName) }
+
+    private fun sha256(b: ByteArray) = MessageDigest.getInstance("SHA-256").digest(b).joinToString("") { "%02x".format(it) }
+
+    /** What the package manager says about an APK file (path) or about an installed package (name), as plain facts. */
+    @Suppress("DEPRECATION")
+    private fun facts(ctx: Context, pathOrPackage: String, archive: Boolean): UpdateLogic.ApkFacts? = try {
+        val pm = ctx.packageManager
+        val flags = if (Build.VERSION.SDK_INT >= 28) PackageManager.GET_SIGNING_CERTIFICATES else PackageManager.GET_SIGNATURES
+        val pi = if (archive) {
+            if (Build.VERSION.SDK_INT >= 33) pm.getPackageArchiveInfo(pathOrPackage, PackageManager.PackageInfoFlags.of(flags.toLong())) else pm.getPackageArchiveInfo(pathOrPackage, flags)
+        } else {
+            if (Build.VERSION.SDK_INT >= 33) pm.getPackageInfo(pathOrPackage, PackageManager.PackageInfoFlags.of(flags.toLong())) else pm.getPackageInfo(pathOrPackage, flags)
+        }
+        if (pi == null) null else {
+            val sigs = if (Build.VERSION.SDK_INT >= 28) pi.signingInfo?.let { if (it.hasMultipleSigners()) it.apkContentsSigners else it.signingCertificateHistory } else pi.signatures
+            val code = if (Build.VERSION.SDK_INT >= 28) pi.longVersionCode else pi.versionCode.toLong()
+            UpdateLogic.ApkFacts(pi.packageName ?: "", code, sigs?.map { sha256(it.toByteArray()) }?.toSet() ?: emptySet())
+        }
+    } catch (_: Exception) { null }
+
+    private fun isDebuggable(ctx: Context, path: String): Boolean = try {
+        val ai = ctx.packageManager.getPackageArchiveInfo(path, 0)?.applicationInfo
+        ai != null && (ai.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0
+    } catch (_: Exception) { false }
+
+    /**
+     * Everything that must hold before the installer is opened: package, versionCode, no downgrade, signer equals the
+     * certificate in the metadata AND the certificate of the installed app, not debuggable.
+     * Returns problem codes (empty = safe to install).
+     */
+    fun verifyApk(ctx: Context, apk: File, info: UpdateInfo): List<String> {
+        val installed = facts(ctx, ctx.packageName, archive = false)
+            ?: UpdateLogic.ApkFacts(ctx.packageName, BuildConfig.VERSION_CODE.toLong(), emptySet())
+        val problems = UpdateLogic.checkApk(info, facts(ctx, apk.path, archive = true), installed, checkInstalledSigner = !BuildConfig.DEBUG).toMutableList()
+        if (isDebuggable(ctx, apk.path)) problems += "APK_DEBUGGABLE"
+        return problems
+    }
 
     fun notifyAvailable(ctx: Context, info: UpdateInfo) {
         val nm = ctx.getSystemService(NotificationManager::class.java)
@@ -59,18 +108,29 @@ object UpdateManager {
         try { nm.notify(7, n) } catch (_: SecurityException) { }
     }
 
-    /** Blocking; retries 3 times and verifies SHA-256 (and size). */
+    /**
+     * Blocking; retries 3 times. The file is written to "<name>.part", checked for size and SHA-256 and only then renamed,
+     * then its package, versionCode and signing certificate are verified. Returns null (and sets [lastFailure]) otherwise.
+     */
     fun download(ctx: Context, info: UpdateInfo, onProgress: (Long, Long) -> Unit): File? {
+        lastFailure = ""
         val dir = File(ctx.cacheDir, "updates").apply { mkdirs() }
+        dir.listFiles()?.forEach { if (it.name != "ludoai-update.apk") it.delete() }       // stale partial downloads
         val target = File(dir, "ludoai-update.apk")
-        val ok = UpdateLogic.downloadWithRetry(3, { f ->
-            val c = open(info.apkUrl); val total = if (info.sizeBytes > 0) info.sizeBytes else c.contentLengthLong
-            c.inputStream.use { i -> f.outputStream().use { o ->
-                val buf = ByteArray(64 * 1024); var done = 0L
-                while (true) { val n = i.read(buf); if (n < 0) break; o.write(buf, 0, n); done += n; onProgress(done, total) }
-            } }
+        val result = UpdateLogic.downloadVerified(3, { f ->
+            val c = open(info.apkUrl)
+            try {
+                val total = if (info.sizeBytes > 0) info.sizeBytes else c.contentLengthLong
+                c.inputStream.use { i -> f.outputStream().use { o ->
+                    val buf = ByteArray(64 * 1024); var done = 0L
+                    while (true) { val n = i.read(buf); if (n < 0) break; o.write(buf, 0, n); done += n; onProgress(done, total) }
+                } }
+            } finally { c.disconnect() }
         }, target, info)
-        return if (ok) target else null
+        if (result != UpdateLogic.DownloadResult.OK) { lastFailure = result.name; return null }
+        val problems = verifyApk(ctx, target, info)
+        if (problems.isNotEmpty()) { target.delete(); lastFailure = problems.joinToString(","); return null }
+        return target
     }
 
     /** Opens the official Android package installer. Never bypasses the install-permission screen. */

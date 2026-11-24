@@ -46,9 +46,52 @@ object S {
         "needsInstall" to ("اسمح بتثبيت التطبيقات من هذا المصدر ثم ارجع" to "Allow installing from this source, then come back"),
         "red" to ("أحمر" to "Red"), "green" to ("أخضر" to "Green"), "yellow" to ("أصفر" to "Yellow"), "blue" to ("أزرق" to "Blue"),
         "notes" to ("ملاحظات الإصدار" to "Release notes"),
+        "extra6" to ("رمية إضافية عند الحصول على 6" to "Extra turn after rolling a 6"),
+        "autoHint" to ("مفعّل افتراضياً. يحلل فقط عند تغيّر الشاشة ولا يستهلك الكثير من البطارية" to "On by default. Analyses only when the screen changes, so idle screens cost almost nothing"),
+        "manualOn" to ("✋ نرد يدوي نشط — لهذه الرمية فقط" to "✋ Manual dice active — this roll only"),
+        "manualClear" to ("إلغاء" to "Clear"),
+        "finishedDecl" to ("🏁 قطع وصلت للنهاية" to "🏁 Pieces finished"),
+        "alternatives" to ("بدائل" to "Alternatives"),
+        "risks" to ("المخاطر" to "Risks"),
+        "required" to ("تحديث مطلوب" to "Update required"),
+        "waiting" to ("بانتظار تحليل الشاشة..." to "Waiting to analyse the screen..."),
         "recommendOnly" to ("يقترح الحركة فقط، ولا يضغط على الشاشة أبداً" to "Recommends only; it never taps the game"),
     )
     fun get(key: String, lang: String): String = t[key]?.let { if (lang == "ar") it.first else it.second } ?: key
+
+    /** Human text for a problem/notice code from the analysis. Unknown codes are shown as-is (never hidden). */
+    fun problem(code: String, lang: String): String {
+        val ar = lang == "ar"
+        return when {
+            code == "BOARD_NOT_FOUND" -> if (ar) "لم أجد لوحة اللعبة على الشاشة" else "Game board not found on screen"
+            code == "BOARD_OVERLAY" -> if (ar) "شيء يغطي اللوحة (إشعار أو نافذة)" else "Something covers the board (popup or toast)"
+            code == "DICE_NOT_FOUND" -> if (ar) "لا أرى نرداً على الشاشة" else "No dice visible on screen"
+            code == "DICE_ANIMATING" -> if (ar) "النرد يتحرك، انتظر قليلاً" else "Dice is rolling, wait a moment"
+            code == "DICE_NOT_STABLE" -> if (ar) "أتأكد من رقم النرد..." else "Confirming the dice value..."
+            code == "DICE_STALE" -> if (ar) "هذا النرد قديم (استُخدم بالفعل). انتظر رمية جديدة" else "This dice was already used. Wait for a new roll"
+            code == "TURN_UNCERTAIN" -> if (ar) "لست متأكداً من صاحب الدور" else "Not sure whose turn it is"
+            code == "NOT_YOUR_TURN" -> if (ar) "ليس دورك الآن" else "It is not your turn"
+            code == "PIECES_UNKNOWN_USER" -> if (ar) "لم أتعرف على كل قطعك الأربع. التقط مرة أخرى أو حدد عدد القطع الواصلة" else "Could not identify all four of your pieces. Capture again or set how many have finished"
+            code == "INCONSISTENT_PIECES" -> if (ar) "قراءة اللوحة غير متسقة" else "Board reading is inconsistent"
+            code.startsWith("TOO_MANY_PIECES") -> if (ar) "عدد القطع المكتشفة أكبر من 4" else "More than four pieces detected"
+            code == "DUPLICATE_SEAT_COLORS" -> if (ar) "لونان متشابهان في مقعدين" else "Two seats look the same colour"
+            code.startsWith("SEAT_COLOR_UNKNOWN") -> if (ar) "لم أتعرف على لون مقعدك" else "Could not read your seat colour"
+            code == "NO_LEGAL_MOVE" -> if (ar) "لا توجد حركة متاحة بهذا الرقم" else "No legal move with this roll"
+            code == "RECALIBRATED" -> if (ar) "تمت إعادة المعايرة (مباراة أو تخطيط جديد)" else "Recalibrated (new match or layout)"
+            code == "HIDDEN_OPPONENT_PIECES" -> if (ar) "بعض قطع الخصوم غير ظاهرة" else "Some opponent pieces are not visible"
+            code == "LOW_CONFIDENCE" -> if (ar) "ثقة التعرف منخفضة" else "Recognition confidence is low"
+            else -> code
+        }
+    }
+
+    fun risk(code: com.ludoai.assistant.core.RiskCode, p: Double, lang: String): String {
+        val pc = (p * 100).toInt(); val ar = lang == "ar"
+        return when (code) {
+            com.ludoai.assistant.core.RiskCode.MOVED_PIECE_CAPTURED -> if (ar) "احتمال أكل القطعة المتحركة $pc%" else "$pc% chance the moved piece is captured"
+            com.ludoai.assistant.core.RiskCode.ANY_PIECE_CAPTURED -> if (ar) "احتمال أكل إحدى قطعك $pc%" else "$pc% chance one of your pieces is captured"
+            com.ludoai.assistant.core.RiskCode.LANDS_ON_DANGER -> if (ar) "تقف في مربع مهدد ($pc%)" else "Lands on a threatened square ($pc%)"
+        }
+    }
 
     fun reason(code: ReasonCode, v: Double, lang: String): String {
         val ar = lang == "ar"

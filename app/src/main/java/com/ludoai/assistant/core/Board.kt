@@ -31,6 +31,12 @@ object Board {
     const val FINISH = 57
     const val PIECES = 4
 
+    /**
+     * Marker for a piece whose position is not known (not seen, not proven finished).
+     * Rules and strategy ignore it: it is neither on the board nor finished.
+     */
+    const val HIDDEN = -1
+
     val track: List<Cell> = buildList {
         for (c in 1..5) add(Cell(c, 6))
         for (r in 5 downTo 0) add(Cell(6, r))

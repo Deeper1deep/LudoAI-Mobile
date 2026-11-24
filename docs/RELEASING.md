@@ -9,3 +9,13 @@
 To change the major/minor version edit `version.properties`. Never lower VERSION_CODE.
 
 Local build in Termux (optional): `./gradlew testDebugUnitTest assembleDebug`.
+
+## Release pipeline guarantees (workflow `release.yml`)
+* Signing certificate must equal the pinned `release/EXPECTED_CERT_SHA256` **and** the one in the published `latest.json`; otherwise the run aborts. No key is ever generated.
+* The APK must verify (v2/v3), have exactly one signer, the right package and versionCode, not be debuggable, and be zip-aligned.
+* `versionCode` = max(latest.json, versions.json, tags, version.properties) + 1; unreadable remote metadata aborts instead of guessing.
+* `latest.json` is generated only from the verified APK (sha256, size, cert), then re-validated against it.
+* Publishing order: **draft release -> re-download asset and compare hash -> publish -> anonymous download and compare -> push latest.json/versions.json/CHANGELOG last.** If anything fails before the metadata push the unreferenced release and tag are deleted. Existing releases are never overwritten.
+* Release notes travel as environment variables / files, never interpolated into shell.
+* Inputs: `mandatory` (force this update) and `min_version_code` (older installs are forced to update).
+* One release at a time (`concurrency`). A release can only be published when `KEYSTORE_*` and `UPDATES_REPO_TOKEN` secrets exist.

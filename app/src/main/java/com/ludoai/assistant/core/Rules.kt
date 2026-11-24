@@ -2,11 +2,16 @@ package com.ludoai.assistant.core
 
 enum class GameMode(val players: Int) { QUICK_2P(2), CLASSIC_4P(4) }
 
-/** Rule switches. Defaults follow the common Yalla Ludo rules; all can be changed in settings. */
+/**
+ * Rule switches. Defaults follow the common Ludo rules and what the app was built against; all can be changed in settings.
+ * NOT VERIFIED against the live game: the exact Yalla Ludo rules per mode (see docs/RULES_VERIFICATION.md).
+ */
 data class RuleSet(
     val sixToEnter: Boolean = true,
     val exactFinish: Boolean = true,
     val safeSquares: Boolean = true,
+    /** A rolled 6 grants another roll. Only used to estimate threats (a 6 followed by another roll). */
+    val extraTurnOnSix: Boolean = true,
 )
 
 /** pieces[seat] = 4 rel positions. Only [active] seats play. */
@@ -53,7 +58,7 @@ object Rules {
         val out = ArrayList<Move>()
         for (i in 0 until Board.PIECES) {
             val from = mine[i]
-            if (from == Board.FINISH) continue
+            if (from < 0 || from == Board.FINISH) continue // hidden (unknown) and finished pieces cannot move
             val to: Int = if (from == 0) {
                 if (rules.sixToEnter && dice != 6) continue
                 1

@@ -24,7 +24,7 @@ class RealScreenshotTest {
         val a = Analyzer.analyze(frame, GameMode.CLASSIC_4P)
         for (s in Seat.values()) {
             val c = a.counts.getValue(s)
-            assertEquals("$s yard", 4, c.yard); assertEquals("$s board", 0, c.onBoard); assertEquals("$s fin", 0, c.finishedInferred)
+            assertEquals("$s yard", 4, c.yard); assertEquals("$s board", 0, c.onBoard); assertEquals("$s fin", 0, c.finished)
         }
     }
 
@@ -98,7 +98,9 @@ class SyntheticVisionTest {
                 assertEquals(st.pieces.getValue(s).count { it == 0 }, a.counts.getValue(s).yard)
             }
             val truth = Strategy.rank(got, Seat.BOTTOM_LEFT, dice)
-            assertEquals(truth.map { it.move.pieceIdx to it.move.to }, a.ranked.map { it.move.pieceIdx to it.move.to })
+            // the ranking now includes lookahead, so the ORDER may differ from the greedy one; the set of legal moves must not
+            assertEquals(truth.map { it.move.pieceIdx to it.move.to }.toSet(), a.ranked.map { it.move.pieceIdx to it.move.to }.toSet())
+            assertTrue("best must be legal", a.best == null || truth.any { it.move.pieceIdx == a.best!!.move.pieceIdx && it.move.to == a.best!!.move.to })
         }
     }
 

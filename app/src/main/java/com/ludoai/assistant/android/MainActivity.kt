@@ -92,6 +92,13 @@ private fun Home(prefs: Prefs, lang: String, screen: MutableState<String>, t: (S
     var overlayOk by remember { mutableStateOf(Settings.canDrawOverlays(ctx)) }
     var notifOk by remember { mutableStateOf(Build.VERSION.SDK_INT < 33 || ContextCompat.checkSelfPermission(ctx, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED) }
     var running by remember { mutableStateOf(AssistantService.running) }
+    // the service can stop itself (✕ button, capture permission revoked, overlay permission revoked): keep the button truthful
+    DisposableEffect(Unit) {
+        val h = android.os.Handler(android.os.Looper.getMainLooper())
+        val r = object : Runnable { override fun run() { running = AssistantService.running; overlayOk = Settings.canDrawOverlays(ctx); h.postDelayed(this, 700) } }
+        h.post(r)
+        onDispose { h.removeCallbacks(r) }
+    }
     val capture = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { r ->
         if (r.resultCode == Activity.RESULT_OK && r.data != null) {
             ContextCompat.startForegroundService(ctx, Intent(ctx, AssistantService::class.java).putExtra("code", r.resultCode).putExtra("data", r.data))
@@ -142,10 +149,12 @@ private fun SettingsScreen(prefs: Prefs, lang: String, setLang: (String) -> Unit
     var autoR by remember { mutableStateOf(prefs.autoRefresh) }; var arrow by remember { mutableStateOf(prefs.showArrow) }
     var autoU by remember { mutableStateOf(prefs.autoUpdateCheck) }; var six by remember { mutableStateOf(prefs.sixToEnter) }
     var exact by remember { mutableStateOf(prefs.exactFinish) }; var safe by remember { mutableStateOf(prefs.safeSquares) }
+    var extra6 by remember { mutableStateOf(prefs.extraTurnOnSix) }
     val ctx = LocalContext.current
     Panel { OutlinedButton(onClick = { setLang(if (lang == "ar") "en" else "ar") }) { Text(t("lang")) } }
     Panel {
         SwitchRow(t("auto"), autoR) { autoR = it; prefs.autoRefresh = it }
+        Text(t("autoHint"), color = Color.Gray, fontSize = 11.sp)
         SwitchRow(t("arrow"), arrow) { arrow = it; prefs.showArrow = it }
         SwitchRow(t("autoupd"), autoU) { autoU = it; prefs.autoUpdateCheck = it; UpdateManager.schedulePeriodic(ctx) }
     }
@@ -153,6 +162,7 @@ private fun SettingsScreen(prefs: Prefs, lang: String, setLang: (String) -> Unit
         SwitchRow(t("six"), six) { six = it; prefs.sixToEnter = it }
         SwitchRow(t("exact"), exact) { exact = it; prefs.exactFinish = it }
         SwitchRow(t("safe"), safe) { safe = it; prefs.safeSquares = it }
+        SwitchRow(t("extra6"), extra6) { extra6 = it; prefs.extraTurnOnSix = it }
     }
 }
 
@@ -174,7 +184,7 @@ private fun UpdatesScreen(prefs: Prefs, lang: String, t: (String) -> String) {
             android.os.Handler(android.os.Looper.getMainLooper()).post {
                 busy = false
                 when (r) {
-                    is UpdateManager.Result.Available -> { info = r.info; status = t("newver") + ": " + r.info.versionName }
+                    is UpdateManager.Result.Available -> { info = r.info; status = t("newver") + ": " + r.info.versionName + (if (r.required) "  ⚠ " + t("required") else "") }
                     UpdateManager.Result.UpToDate -> { info = null; status = t("uptodate") }
                     is UpdateManager.Result.Error -> status = t("failed") + " (" + r.message + ")"
                 }
@@ -195,7 +205,7 @@ private fun UpdatesScreen(prefs: Prefs, lang: String, t: (String) -> String) {
                     val f = UpdateManager.download(ctx, i) { d, total -> if (total > 0) android.os.Handler(android.os.Looper.getMainLooper()).post { status = "${d * 100 / total}%" } }
                     android.os.Handler(android.os.Looper.getMainLooper()).post {
                         busy = false
-                        if (f == null) status = t("failed") + " - SHA-256 / " + t("retry")
+                        if (f == null) status = t("failed") + " - " + UpdateManager.lastFailure.ifEmpty { "SHA-256" } + " / " + t("retry")
                         else status = if (UpdateManager.install(ctx, f)) "" else t("needsInstall")
                     }
                 }
